@@ -1,0 +1,23 @@
+fastapi
+uvicorn
+supabase
+numpy
+pandas
+scikit-learn
+apscheduler
+twilio
+sendgrid
+httpx
+python-dotenv
+joblib
+# required at runtime by FastAPI's File()/Form() -- POST /models/upload uses both
+python-multipart
+# torch is intentionally NOT installed here. It never goes on Render --
+# models/anomaly.py and models/forecast.py guard every `import torch` behind
+# a try/except (TORCH_AVAILABLE), so they still import and run fine without
+# it. Consequence: TORCH_AVAILABLE is always False on Render, so an uploaded
+# .pt file saves correctly via POST /models/upload but is never loaded for
+# predict()/predict_24h() -- the sklearn IsolationForest / LinearRegression
+# fallback stays active permanently. Training (and whatever actually
+# consumes the .pt files) happens in the local training venv, which installs
+# torch separately -- see train_powersense_pytorch.py's own setup notes.

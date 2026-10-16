@@ -1,0 +1,33 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+
+# --- environment secrets (never commit real credentials) ---
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# --- trained model artifacts (uploaded at runtime via POST /models/upload,
+# not source-controlled -- keep the directory structure via .gitkeep only) ---
+models/trained/*
+!models/trained/.gitkeep
+
+# --- frontend (Vite/React) ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.local
+
+# --- editor / OS cruft ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- local Claude Code tool config (not meant to be shared) ---
+.claude/
