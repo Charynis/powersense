@@ -261,7 +261,16 @@ def get_devices() -> List[str]:
 # derived_values
 # ---------------------------------------------------------------------------
 def insert_derived_values(device_id: str, data_dict: Dict[str, Any]) -> bool:
-    """Insert one derived_values row. Returns True on success."""
+    """Upsert one derived_values row. Returns True on success.
+
+    Upsert, not insert, on the (device_id, timestamp) unique constraint: the
+    engine job runs every 30s regardless of whether a new raw reading has
+    actually arrived, so a sensor that stalls or posts slower than that
+    (dead battery, lost wifi, a quiet overnight gap) makes the same
+    reading's timestamp get reprocessed repeatedly -- a plain insert would
+    hit a duplicate-key error on every single tick until new data shows up,
+    which is normal IoT behaviour, not a failure worth logging as one.
+    """
     client = get_client()
     if client is None:
         return False
@@ -275,7 +284,7 @@ def insert_derived_values(device_id: str, data_dict: Dict[str, Any]) -> bool:
         payload["alerts"] = ", ".join(str(a) for a in payload["alerts"])
 
     try:
-        client.table(T_DERIVED).insert(payload).execute()
+        client.table(T_DERIVED).upsert(payload, on_conflict="device_id,timestamp").execute()
         return True
     except Exception as exc:
         logger.error("insert_derived_values(%s) failed: %s", device_id, exc)
