@@ -45,7 +45,7 @@ import {
 // ---------------------------------------------------------------------------
 const SUPABASE_URL = "https://cgvjqmqdbsdneukkhbfc.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_lmNUWoyMAImqbsKshbKbBw_XcLVbQqe";
-const RENDER_URL = "https://powersense-pro.onrender.com";
+const RENDER_URL = "https://powersense-6iuu.onrender.com";
 const DEVICE_ID = "table_fan"; // matches the device_id actually posting to energy_readings_public
 const REFRESH_INTERVAL = 30000; // 30 seconds
 
