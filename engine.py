@@ -49,18 +49,18 @@ class MachineConfig:
 
 
 DEFAULT_CONFIG = MachineConfig(
-    device_id="hackathon_machine",
-    machine_name="Demo Machine",
-    rated_current=10.0,
-    rated_power=2000.0,
-    nominal_voltage=230.0,
-    cable_resistance=0.5,
-    tariff_rate=9.0,
-    idle_threshold_pct=8.0,
-    rated_pf=0.85,
-    shift_hours=8.0,
-    india_grid_factor=0.82,
-    phase_type="single_phase",
+    device_id          = "hackathon_machine",
+    machine_name       = "Table Fan Demo",
+    rated_current      = 0.036,    # high mode current
+    rated_power        = 5.0,      # slightly above high mode 4.7W
+    nominal_voltage    = 230.0,
+    cable_resistance   = 0.5,
+    tariff_rate        = 9.0,
+    idle_threshold_pct = 20.0,     # below 20% of 5W = below 1W = off
+    rated_pf           = 0.60,     # your fan's realistic PF
+    shift_hours        = 8.0,
+    india_grid_factor  = 0.82,
+    phase_type         = "single_phase"
 )
 
 
@@ -322,7 +322,9 @@ def calculate_derived_values(
     nominal_voltage = config.nominal_voltage if config.nominal_voltage > 0 else 230.0
 
     # --- POWER -------------------------------------------------------------
-    apparent_power = voltage * current  # VA
+    # Safe apparent power calculation: fall back to active_power when current
+    # is near zero, since voltage * current is unreliable at that point.
+    apparent_power = voltage * current if current > 0.01 else active_power  # VA
 
     # Reactive power from the power triangle. Clamp the radicand: a PZEM can
     # report an active power slightly above V*I because the three values are
@@ -371,9 +373,12 @@ def calculate_derived_values(
     )
 
     # --- HEALTH ------------------------------------------------------------
-    motor_efficiency_est = (
-        (active_power / apparent_power) * 100.0 if apparent_power > 0 else 0.0
-    )
+    # Safe motor efficiency: fall back to power factor when apparent power is
+    # too small for the ratio to be meaningful.
+    if apparent_power > 0.1:
+        motor_efficiency_est = (active_power / apparent_power) * 100.0
+    else:
+        motor_efficiency_est = power_factor * 100.0  # fallback
     motor_efficiency_est = _clamp(motor_efficiency_est, 0.0, 100.0)
 
     load_factor = (active_power / rated_power) * 100.0
