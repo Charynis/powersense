@@ -208,7 +208,7 @@ def fetch_from_supabase(table: str = SUPABASE_TABLE, page_size: int = 1000) -> p
         res = (
             client.table(table)
             .select("*")
-            .order("timestamp", desc=False)
+            .order("created_at", desc=False)
             .range(start, start + page_size - 1)
             .execute()
         )
@@ -229,8 +229,8 @@ def fetch_from_supabase(table: str = SUPABASE_TABLE, page_size: int = 1000) -> p
 def _apply_gaussian_noise(
     frame: pd.DataFrame, rng: np.random.Generator, power_bounds: "tuple[float, float]"
 ) -> pd.DataFrame:
-    """Add sensor-realistic jitter to voltage/current/power_factor/power, in
-    place on a copy, clamped back into physically plausible bounds."""
+    """Add sensor-realistic jitter to voltage/current/power_factor/active_power,
+    in place on a copy, clamped back into physically plausible bounds."""
     frame = frame.copy()
     n = len(frame)
     if "voltage" in frame.columns:
@@ -248,10 +248,10 @@ def _apply_gaussian_noise(
             pd.to_numeric(frame["power_factor"], errors="coerce").fillna(0.0) + rng.normal(0, 0.02, n),
             0.0, 1.0,
         )
-    if "power" in frame.columns:
+    if "active_power" in frame.columns:
         low, high = power_bounds
-        frame["power"] = _clip(
-            pd.to_numeric(frame["power"], errors="coerce").fillna(0.0) + rng.normal(0, 0.1, n),
+        frame["active_power"] = _clip(
+            pd.to_numeric(frame["active_power"], errors="coerce").fillna(0.0) + rng.normal(0, 0.1, n),
             low, high,
         )
     return frame
@@ -273,19 +273,19 @@ def _gaussian_noise_copies(
 
 def _time_interpolated_rows(df: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
     """One synthetic row linearly interpolated between each pair of
-    consecutive real readings (sorted by timestamp), simulating a higher
+    consecutive real readings (sorted by created_at), simulating a higher
     sampling frequency than the sensor actually runs at.
     """
-    if len(df) < 2 or "timestamp" not in df.columns:
+    if len(df) < 2 or "created_at" not in df.columns:
         return df.iloc[0:0]
 
     ordered = df.copy()
-    ordered["__ts"] = pd.to_datetime(ordered["timestamp"], errors="coerce", utc=True)
+    ordered["__ts"] = pd.to_datetime(ordered["created_at"], errors="coerce", utc=True)
     ordered = ordered.dropna(subset=["__ts"]).sort_values("__ts").reset_index(drop=True)
     if len(ordered) < 2:
         return df.iloc[0:0]
 
-    skip_cols = {"__ts", "timestamp", "device_id"}
+    skip_cols = {"__ts", "created_at", "device_id", "id"}
     numeric_cols = [
         c for c in ordered.columns
         if c not in skip_cols and pd.to_numeric(ordered[c], errors="coerce").notna().any()
@@ -299,7 +299,7 @@ def _time_interpolated_rows(df: pd.DataFrame, rng: np.random.Generator) -> pd.Da
         for col in numeric_cols:
             av, bv = _f(a.get(col)), _f(b.get(col))
             mid[col] = av + (bv - av) * frac
-        mid["timestamp"] = (a["__ts"] + (b["__ts"] - a["__ts"]) * frac).isoformat()
+        mid["created_at"] = (a["__ts"] + (b["__ts"] - a["__ts"]) * frac).isoformat()
         rows.append(mid)
 
     out = pd.DataFrame(rows).drop(columns=["__ts"], errors="ignore")
@@ -332,8 +332,8 @@ def augment_data(df: pd.DataFrame, target: int = 20000) -> pd.DataFrame:
     base = df.reset_index(drop=True)
 
     power_bounds = (0.0, 0.0)
-    if "power" in base.columns:
-        base_power = pd.to_numeric(base["power"], errors="coerce").dropna()
+    if "active_power" in base.columns:
+        base_power = pd.to_numeric(base["active_power"], errors="coerce").dropna()
         if len(base_power):
             power_bounds = (max(0.0, float(base_power.min()) - 1.0), float(base_power.max()) + 1.0)
 
@@ -362,19 +362,20 @@ def augment_data(df: pd.DataFrame, target: int = 20000) -> pd.DataFrame:
 #    pipeline's math exactly instead of re-deriving it independently.
 # ---------------------------------------------------------------------------
 def derive_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Run every row through engine.calculate_derived_values(), renaming
-    this table's `power`/`energy` columns to the `active_power`/
-    `active_energy` names engine.py expects.
+    """Run every row through engine.calculate_derived_values() -- this
+    table's columns already match engine.py's names (active_power,
+    active_energy, ...); only created_at needs to be handed through as the
+    timestamp engine.py expects.
     """
     records = []
     for row in df.to_dict("records"):
         reading = {
             "device_id": row.get("device_id"),
-            "timestamp": row.get("timestamp"),
+            "timestamp": row.get("created_at"),
             "voltage": row.get("voltage"),
             "current": row.get("current"),
-            "active_power": row.get("power"),
-            "active_energy": row.get("energy"),
+            "active_power": row.get("active_power"),
+            "active_energy": row.get("active_energy"),
             "frequency": row.get("frequency"),
             "power_factor": row.get("power_factor"),
         }
