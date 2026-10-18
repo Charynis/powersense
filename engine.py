@@ -21,7 +21,17 @@ from typing import Any, Dict, List, Optional
 WORKING_DAYS_PER_MONTH = 26
 
 # Power below this (W) means the machine is electrically off, not idle.
+# Capped per-machine at a fraction of rated_power so a small-appliance config
+# (e.g. a 5W fan) doesn't get stuck reporting "off" forever just because it
+# can never reach this flat watt figure, which was tuned for a 2000W machine.
 OFF_POWER_THRESHOLD_W = 10.0
+OFF_POWER_THRESHOLD_PCT_OF_RATED = 10.0
+
+# Current below this fraction of rated_current is treated as "off" even if
+# active_power reads a few watts -- cheap power sensors report a noise/offset
+# wattage at zero current, which on a small appliance can otherwise look like
+# real load.
+OFF_CURRENT_PCT_OF_RATED = 10.0
 
 # Number of trailing power samples used for the stability index.
 STABILITY_WINDOW = 20
@@ -118,10 +128,18 @@ def classify_voltage_status(deviation_pct: float) -> str:
 
 
 def classify_machine_state(
-    active_power: float, load_factor: float, idle_threshold_pct: float
+    active_power: float, load_factor: float, idle_threshold_pct: float,
+    rated_power: float = 0.0, current: Optional[float] = None, rated_current: float = 0.0,
 ) -> str:
     """Operational state derived from absolute power and load factor."""
-    if active_power < OFF_POWER_THRESHOLD_W:
+    if current is not None and rated_current > 0:
+        if current < rated_current * OFF_CURRENT_PCT_OF_RATED / 100.0:
+            return "off"
+
+    off_threshold_w = OFF_POWER_THRESHOLD_W
+    if rated_power > 0:
+        off_threshold_w = min(OFF_POWER_THRESHOLD_W, rated_power * OFF_POWER_THRESHOLD_PCT_OF_RATED / 100.0)
+    if active_power < off_threshold_w:
         return "off"
     if load_factor < idle_threshold_pct:
         return "idle"
@@ -395,7 +413,7 @@ def calculate_derived_values(
 
     # --- OPERATIONAL -------------------------------------------------------
     machine_state = classify_machine_state(
-        active_power, load_factor, config.idle_threshold_pct
+        active_power, load_factor, config.idle_threshold_pct, rated_power, current, rated_current
     )
     utilization_pct = _clamp((active_power / rated_power) * 100.0, 0.0, 100.0)
     carbon_footprint_kg = power_kw * config.india_grid_factor
