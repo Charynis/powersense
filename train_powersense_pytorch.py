@@ -2,29 +2,42 @@
 PowerSense Pro -- offline PyTorch training script.
 
 Trains the two optional PyTorch upgrades that models/anomaly.py and
-models/forecast.py will pick up automatically if present:
+models/forecast.py pick up automatically if present:
 
   - an Autoencoder (10 features) for anomaly detection, replacing the
     in-process IsolationForest
   - a BiLSTM (48h window -> 24h forecast) for energy forecasting, replacing
     the in-process LinearRegression / hourly-profile fallback
 
+Pipeline: fetch_from_supabase() -> augment_data() -> derive_features() (runs
+every row through engine.py's own calculate_derived_values, so the feature
+set here is identical to what the live pipeline computes) -> train + save.
+
 This never runs on Render -- torch is intentionally not in requirements.txt
-(see the note there). Run it locally instead, in its own venv:
+(see the note there). Run it locally instead, in its own venv (see
+requirements_training.txt and the commands at the bottom of this docstring).
 
-    pip install torch joblib scikit-learn pandas numpy python-dotenv
-    python train_powersense_pytorch.py                  # all devices
-    python train_powersense_pytorch.py --device my_dev   # one device
+Reads SUPABASE_URL / SUPABASE_KEY from a .env file in this directory (see
+.env.example) -- the *anon* key for the read-only energy_readings_public
+table, independent of the main app's SUPABASE_SERVICE_KEY.
 
-It needs the same SUPABASE_URL / SUPABASE_SERVICE_KEY as the main app (a
-.env file in this directory is picked up automatically via db.py).
-
-Output (dropped into models/trained/, picked up on the app's next restart):
+Output (dropped into models/trained/ -- the same directory POST
+/models/upload writes to and the live app reads from):
     anomaly_{device_id}.pt
     anomaly_scaler.pkl                 (shared across devices)
     anomaly_threshold_{device_id}.pkl
     forecast_{device_id}.pt
     forecast_scaler.pkl                (shared across devices)
+
+Setup + run:
+    python -m venv venv311
+    venv311\\Scripts\\activate
+    pip install -r requirements_training.txt
+    copy .env.example .env   # then fill in SUPABASE_URL / SUPABASE_KEY
+    python train_powersense_pytorch.py
+
+Push the result to a deployed instance (e.g. Render):
+    python upload_models.py --url https://your-app.onrender.com
 """
 
 import argparse
@@ -32,21 +45,32 @@ import logging
 import math
 import os
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Dict, List
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+from dotenv import load_dotenv
 from sklearn.preprocessing import StandardScaler
+from supabase import create_client
 from torch.utils.data import DataLoader, TensorDataset
 
-import db  # repo-root module -- Supabase reads
+import engine  # repo-root module -- calculate_derived_values(), DEFAULT_CONFIG
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("powersense.train")
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "energy_readings_public")
+
+# Same default the live app uses (main.py's MODEL_UPLOAD_DIR, models/anomaly.py
+# and models/forecast.py's MODEL_DIR) -- training writes straight into the
+# directory the running app already reads from.
 MODEL_DIR = os.environ.get(
     "MODEL_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "trained")
 )
@@ -163,22 +187,50 @@ def _ensure_dir(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# fetching
+# 1. fetching
 # ---------------------------------------------------------------------------
-def fetch_real_data(device_id: str, limit: int = 50000) -> pd.DataFrame:
-    """Oldest-first derived_values history for one device."""
-    rows = db.get_derived_history(device_id, limit=limit)
+def fetch_from_supabase(table: str = SUPABASE_TABLE, page_size: int = 1000) -> pd.DataFrame:
+    """All rows from `table`, oldest first, paginated past Supabase's
+    default 1000-row response cap (harmless at 658 rows today, keeps this
+    working once the sensor has logged a lot more).
+    """
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError(
+            "SUPABASE_URL / SUPABASE_KEY are not set. Copy .env.example to .env "
+            "in this directory and fill in your project URL + anon key."
+        )
+
+    client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    rows: List[dict] = []
+    start = 0
+    while True:
+        res = (
+            client.table(table)
+            .select("*")
+            .order("timestamp", desc=False)
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+
     df = pd.DataFrame(rows)
-    logger.info("Fetched %d real rows for %s from Supabase", len(df), device_id)
+    logger.info("Fetched %d real rows from Supabase table '%s'", len(df), table)
     return df
 
 
 # ---------------------------------------------------------------------------
-# augmentation
+# 2. augmentation
 # ---------------------------------------------------------------------------
-def _apply_gaussian_noise(frame: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
-    """Add sensor-realistic jitter to voltage/current/power_factor, in place
-    on a copy, clamped back into physically plausible bounds."""
+def _apply_gaussian_noise(
+    frame: pd.DataFrame, rng: np.random.Generator, power_bounds: "tuple[float, float]"
+) -> pd.DataFrame:
+    """Add sensor-realistic jitter to voltage/current/power_factor/power, in
+    place on a copy, clamped back into physically plausible bounds."""
     frame = frame.copy()
     n = len(frame)
     if "voltage" in frame.columns:
@@ -196,24 +248,32 @@ def _apply_gaussian_noise(frame: pd.DataFrame, rng: np.random.Generator) -> pd.D
             pd.to_numeric(frame["power_factor"], errors="coerce").fillna(0.0) + rng.normal(0, 0.02, n),
             0.0, 1.0,
         )
+    if "power" in frame.columns:
+        low, high = power_bounds
+        frame["power"] = _clip(
+            pd.to_numeric(frame["power"], errors="coerce").fillna(0.0) + rng.normal(0, 0.1, n),
+            low, high,
+        )
     return frame
 
 
-def _gaussian_noise_copies(df: pd.DataFrame, rng: np.random.Generator, copies: int = 10) -> pd.DataFrame:
-    """Method 1 (most important) -- `copies` noisy near-duplicates of every
-    real row. This is the bulk of the augmented set: it teaches the model
-    the few-percent sensor jitter every reading already has, instead of
-    letting it memorise exact training values.
+def _gaussian_noise_copies(
+    df: pd.DataFrame, rng: np.random.Generator, power_bounds: "tuple[float, float]", copies: int = 10
+) -> pd.DataFrame:
+    """`copies` noisy near-duplicates of every real row -- the bulk of the
+    augmented set. Teaches the model the few-percent sensor jitter every
+    reading already has, instead of letting it memorise exact training
+    values.
     """
     if df.empty:
         return df.iloc[0:0]
     tiled = pd.concat([df] * copies, ignore_index=True)
-    return _apply_gaussian_noise(tiled, rng)
+    return _apply_gaussian_noise(tiled, rng, power_bounds)
 
 
 def _time_interpolated_rows(df: pd.DataFrame, rng: np.random.Generator) -> pd.DataFrame:
-    """Method 2 -- one synthetic row linearly interpolated between each pair
-    of consecutive real readings (sorted by timestamp), simulating a higher
+    """One synthetic row linearly interpolated between each pair of
+    consecutive real readings (sorted by timestamp), simulating a higher
     sampling frequency than the sensor actually runs at.
     """
     if len(df) < 2 or "timestamp" not in df.columns:
@@ -225,8 +285,7 @@ def _time_interpolated_rows(df: pd.DataFrame, rng: np.random.Generator) -> pd.Da
     if len(ordered) < 2:
         return df.iloc[0:0]
 
-    skip_cols = {"__ts", "timestamp", "device_id", "machine_name", "pf_status",
-                 "voltage_status", "machine_state", "motor_health_label", "alerts"}
+    skip_cols = {"__ts", "timestamp", "device_id"}
     numeric_cols = [
         c for c in ordered.columns
         if c not in skip_cols and pd.to_numeric(ordered[c], errors="coerce").notna().any()
@@ -253,43 +312,18 @@ def _time_interpolated_rows(df: pd.DataFrame, rng: np.random.Generator) -> pd.Da
     return out
 
 
-def _speed_mode_cycles(df: pd.DataFrame, rng: np.random.Generator, cycles: int = 2) -> pd.DataFrame:
-    """Method 3 -- duplicate the whole sequence `cycles` times, each scaled
-    by a factor in [0.85, 1.15] on the load-bearing columns, simulating the
-    same machine running at a different load / speed setting.
-    """
-    if df.empty:
-        return df.iloc[0:0]
-
-    load_cols = [c for c in ("current", "active_power", "apparent_power", "reactive_power", "cable_loss")
-                 if c in df.columns]
-    out_frames = []
-    for _ in range(cycles):
-        scale = float(rng.uniform(0.85, 1.15))
-        copy = df.copy()
-        for col in load_cols:
-            copy[col] = pd.to_numeric(copy[col], errors="coerce").fillna(0.0) * scale
-        if "current" in copy.columns:
-            copy["current"] = _clip(copy["current"], 0.0, 0.5)
-        out_frames.append(copy)
-    return pd.concat(out_frames, ignore_index=True) if out_frames else df.iloc[0:0]
-
-
-def augment_data(df: pd.DataFrame, target_rows: int = 20000) -> pd.DataFrame:
-    """Expand real sensor rows up to `target_rows` so the networks trained
-    below have enough samples without needing weeks of real logging first.
-
-    Combines three methods -- Gaussian noise injection (the bulk of the
-    volume), time interpolation between real readings, and scaled
-    "speed mode" duplicate sequences -- then tops up and shuffles to land
-    on an exact row count.
+def augment_data(df: pd.DataFrame, target: int = 20000) -> pd.DataFrame:
+    """Expand real sensor rows up to `target` rows via Gaussian noise
+    injection (the bulk of the volume) and linear interpolation between
+    real readings, so the networks trained below have enough samples
+    without needing weeks of real logging first. Shuffles before returning.
     """
     real_rows = len(df)
     if real_rows == 0:
         logger.warning("augment_data: no real rows supplied, nothing to augment")
         return df
 
-    if real_rows >= target_rows:
+    if real_rows >= target:
         result = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
         print(f"Augmented {real_rows} real rows -> {len(result)} total rows")
         return result
@@ -297,21 +331,26 @@ def augment_data(df: pd.DataFrame, target_rows: int = 20000) -> pd.DataFrame:
     rng = np.random.default_rng(42)
     base = df.reset_index(drop=True)
 
+    power_bounds = (0.0, 0.0)
+    if "power" in base.columns:
+        base_power = pd.to_numeric(base["power"], errors="coerce").dropna()
+        if len(base_power):
+            power_bounds = (max(0.0, float(base_power.min()) - 1.0), float(base_power.max()) + 1.0)
+
     pieces = [
         base,
-        _gaussian_noise_copies(base, rng, copies=10),
+        _gaussian_noise_copies(base, rng, power_bounds, copies=10),
         _time_interpolated_rows(base, rng),
-        _speed_mode_cycles(base, rng, cycles=2),
     ]
     augmented = pd.concat([p for p in pieces if len(p)], ignore_index=True)
 
-    if len(augmented) < target_rows:
-        shortfall = target_rows - len(augmented)
+    if len(augmented) < target:
+        shortfall = target - len(augmented)
         topup_base = base.sample(n=shortfall, replace=True, random_state=42).reset_index(drop=True)
-        topup = _apply_gaussian_noise(topup_base, rng)
+        topup = _apply_gaussian_noise(topup_base, rng, power_bounds)
         augmented = pd.concat([augmented, topup], ignore_index=True)
-    elif len(augmented) > target_rows:
-        augmented = augmented.sample(n=target_rows, random_state=42)
+    elif len(augmented) > target:
+        augmented = augmented.sample(n=target, random_state=42)
 
     augmented = augmented.sample(frac=1.0, random_state=42).reset_index(drop=True)
     print(f"Augmented {real_rows} real rows -> {len(augmented)} total rows")
@@ -319,8 +358,30 @@ def augment_data(df: pd.DataFrame, target_rows: int = 20000) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# feature engineering
+# 3. feature engineering -- reuses engine.py so this matches the live
+#    pipeline's math exactly instead of re-deriving it independently.
 # ---------------------------------------------------------------------------
+def derive_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Run every row through engine.calculate_derived_values(), renaming
+    this table's `power`/`energy` columns to the `active_power`/
+    `active_energy` names engine.py expects.
+    """
+    records = []
+    for row in df.to_dict("records"):
+        reading = {
+            "device_id": row.get("device_id"),
+            "timestamp": row.get("timestamp"),
+            "voltage": row.get("voltage"),
+            "current": row.get("current"),
+            "active_power": row.get("power"),
+            "active_energy": row.get("energy"),
+            "frequency": row.get("frequency"),
+            "power_factor": row.get("power_factor"),
+        }
+        records.append(engine.calculate_derived_values(reading, engine.DEFAULT_CONFIG))
+    return pd.DataFrame(records)
+
+
 def build_anomaly_matrix(df: pd.DataFrame) -> np.ndarray:
     """ANOMALY_FEATURES columns, in order, as a float32 matrix."""
     frame = df.copy()
@@ -375,7 +436,7 @@ def build_forecast_windows(hourly: pd.DataFrame, scaler: StandardScaler):
 
 
 # ---------------------------------------------------------------------------
-# training
+# 4. training
 # ---------------------------------------------------------------------------
 def train_autoencoder(device_id: str, matrix: np.ndarray, scaler: StandardScaler) -> None:
     if len(matrix) < 50:
@@ -479,50 +540,51 @@ def train_forecaster(device_id: str, X: np.ndarray, y: np.ndarray) -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description="Offline PyTorch training for PowerSense Pro")
-    parser.add_argument(
-        "--device", action="append", dest="devices",
-        help="Device ID to train (repeatable). Default: every device seen in Supabase.",
-    )
-    parser.add_argument("--target-rows", type=int, default=20000, help="Rows to augment each device up to.")
+    parser.add_argument("--table", default=SUPABASE_TABLE, help="Supabase table to read raw readings from.")
+    parser.add_argument("--target", type=int, default=20000, help="Row count to augment up to.")
     args = parser.parse_args()
 
-    devices = args.devices or db.get_devices()
-    if not devices:
-        logger.error("No devices found in Supabase -- nothing to train.")
+    raw_df = fetch_from_supabase(table=args.table)
+    if raw_df.empty:
+        logger.error("No rows returned from Supabase table '%s' -- aborting.", args.table)
         return
 
-    per_device_data: Dict[str, pd.DataFrame] = {}
-    for device_id in devices:
-        real_df = fetch_real_data(device_id)
-        if real_df.empty:
-            logger.warning("No data for %s -- skipping.", device_id)
-            continue
-        per_device_data[device_id] = augment_data(real_df, target_rows=args.target_rows)
+    augmented = augment_data(raw_df, target=args.target)
+    derived = derive_features(augmented)
 
-    if not per_device_data:
-        logger.error("No usable data for any device -- aborting.")
-        return
+    devices = (
+        sorted(d for d in derived["device_id"].dropna().unique().tolist())
+        if "device_id" in derived.columns else []
+    ) or ["default"]
 
-    # -- shared scalers, fit once across every device's augmented data -----
     _ensure_dir(MODEL_DIR)
 
+    # -- shared scalers, fit once across every device's data ---------------
     anomaly_scaler = StandardScaler()
-    anomaly_scaler.fit(np.concatenate([build_anomaly_matrix(df) for df in per_device_data.values()]))
+    anomaly_scaler.fit(build_anomaly_matrix(derived))
     joblib.dump(anomaly_scaler, os.path.join(MODEL_DIR, "anomaly_scaler.pkl"))
 
-    hourly_by_device = {dev: build_hourly_series(df) for dev, df in per_device_data.items()}
-    forecastable_hourly = [h for h in hourly_by_device.values() if len(h) >= MIN_FORECAST_HOURS]
+    hourly_by_device: Dict[str, pd.DataFrame] = {}
+    for device_id in devices:
+        subset = derived[derived["device_id"] == device_id] if "device_id" in derived.columns else derived
+        hourly_by_device[device_id] = build_hourly_series(subset)
 
+    forecastable = [h for h in hourly_by_device.values() if len(h) >= MIN_FORECAST_HOURS]
     forecast_scaler = StandardScaler()
-    if forecastable_hourly:
-        forecast_scaler.fit(np.concatenate([h[FORECAST_FEATURES].to_numpy(dtype=np.float32) for h in forecastable_hourly]))
+    if forecastable:
+        forecast_scaler.fit(np.concatenate([h[FORECAST_FEATURES].to_numpy(dtype=np.float32) for h in forecastable]))
         joblib.dump(forecast_scaler, os.path.join(MODEL_DIR, "forecast_scaler.pkl"))
     else:
-        logger.warning("No device has %d+ distinct hours of data -- skipping forecaster training entirely.", MIN_FORECAST_HOURS)
+        logger.warning(
+            "No device has %d+ distinct hours of data yet -- skipping forecaster training "
+            "entirely (the anomaly autoencoder doesn't need a time span, so it still trains).",
+            MIN_FORECAST_HOURS,
+        )
 
     # -- per-device training -------------------------------------------------
-    for device_id, aug_df in per_device_data.items():
-        train_autoencoder(device_id, build_anomaly_matrix(aug_df), anomaly_scaler)
+    for device_id in devices:
+        subset = derived[derived["device_id"] == device_id] if "device_id" in derived.columns else derived
+        train_autoencoder(device_id, build_anomaly_matrix(subset), anomaly_scaler)
 
         hourly = hourly_by_device[device_id]
         if len(hourly) < MIN_FORECAST_HOURS:

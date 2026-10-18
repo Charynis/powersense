@@ -1,0 +1,14 @@
+# PowerSense Pro -- offline training environment (venv311, local only).
+# Install with: pip install -r requirements_training.txt
+#
+# Intentionally separate from requirements.txt: torch and friends never go
+# on Render -- see the note in requirements.txt for why.
+
+torch
+pandas
+numpy
+scikit-learn
+joblib
+supabase
+python-dotenv
+httpx
