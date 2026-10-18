@@ -5,6 +5,7 @@ __pycache__/
 venv/
 .venv/
 env/
+venv311/
 
 # --- environment secrets (never commit real credentials) ---
 .env
