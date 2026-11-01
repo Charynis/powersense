@@ -38,6 +38,12 @@ logger = logging.getLogger("powersense.scheduler")
 DEVICE_ID = os.environ.get("DEVICE_ID", "hackathon_machine")
 MACHINE_NAME = os.environ.get("MACHINE_NAME", "Demo Machine")
 
+# DL_ONLY=true is for a local instance running alongside Render against the
+# same Supabase: it only runs the PyTorch models (autoencoder / BiLSTM) and
+# skips the engine, fault, alert, health and daily jobs Render already runs.
+DL_ONLY = os.environ.get("DL_ONLY", "false").lower() in ("true", "1", "yes")
+DL_BACKENDS = ("autoencoder", "bilstm")
+
 ENGINE_INTERVAL_SECONDS = 30
 ANOMALY_INTERVAL_MINUTES = 5
 FORECAST_INTERVAL_MINUTES = 30
@@ -609,15 +615,18 @@ def start_scheduler(device_id: str = DEVICE_ID):
     except Exception as exc:
         logger.error("startup training failed: %s", exc)
 
-    try:
-        run_engine_job(device_id)
-    except Exception as exc:
-        logger.error("startup engine run failed: %s", exc)
-
     scheduler = AsyncIOScheduler(
         timezone="UTC",
         job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 60},
     )
+
+    if DL_ONLY:
+        return _start_dl_only(scheduler, device_id, IntervalTrigger)
+
+    try:
+        run_engine_job(device_id)
+    except Exception as exc:
+        logger.error("startup engine run failed: %s", exc)
 
     scheduler.add_job(
         run_engine_job,
@@ -665,6 +674,38 @@ def start_scheduler(device_id: str = DEVICE_ID):
     logger.info(
         "Scheduler started for %s with %s jobs", device_id, len(scheduler.get_jobs())
     )
+    return scheduler
+
+
+def _start_dl_only(scheduler, device_id: str, IntervalTrigger):
+    """Register only the jobs whose model is a PyTorch backend, run each once
+    so the dashboard has a DL prediction immediately, and start."""
+    global _scheduler
+    bundle = get_models(device_id)
+    jobs = []
+    if bundle.anomaly.status().get("backend") in DL_BACKENDS:
+        jobs.append((run_anomaly_job, IntervalTrigger(minutes=ANOMALY_INTERVAL_MINUTES),
+                     "anomaly", "Autoencoder anomaly (5min, DL_ONLY)"))
+    if bundle.forecast.status().get("backend") in DL_BACKENDS:
+        jobs.append((run_forecast_job, IntervalTrigger(minutes=FORECAST_INTERVAL_MINUTES),
+                     "forecast", "BiLSTM forecast (30min, DL_ONLY)"))
+    if not jobs:
+        logger.warning(
+            "DL_ONLY is set but no PyTorch model is loaded for %s -- is torch "
+            "installed and are the .pt files in models/trained/?", device_id,
+        )
+
+    for func, trigger, job_id, name in jobs:
+        try:
+            func(device_id)
+        except Exception as exc:
+            logger.error("startup %s run failed: %s", job_id, exc)
+        scheduler.add_job(func, trigger, args=[device_id], id=job_id, name=name,
+                          replace_existing=True)
+
+    scheduler.start()
+    _scheduler = scheduler
+    logger.info("Scheduler started in DL_ONLY mode for %s with %s jobs", device_id, len(jobs))
     return scheduler
 
 

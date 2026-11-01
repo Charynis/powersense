@@ -229,9 +229,30 @@ def derived_history(
 # ---------------------------------------------------------------------------
 # predictions
 # ---------------------------------------------------------------------------
+def _own_backend_filter(device_id: str):
+    """Render (sklearn) and a local DL_ONLY instance (PyTorch) write to the
+    same predictions table. Keep only anomaly/forecast rows whose model is DL
+    exactly when this server's own model is DL, so each dashboard shows the
+    outputs of the backend it is talking to. Other types pass through."""
+    bundle = sched.get_models(device_id)
+    active_is_dl = {
+        "anomaly": bundle.anomaly.status().get("backend") in sched.DL_BACKENDS,
+        "forecast": bundle.forecast.status().get("backend") in sched.DL_BACKENDS,
+    }
+
+    def keep(row: Dict[str, Any]) -> bool:
+        ptype = row.get("prediction_type")
+        if ptype not in active_is_dl:
+            return True
+        backend = (row.get("details") or {}).get("backend")
+        return (backend in sched.DL_BACKENDS) == active_is_dl[ptype]
+
+    return keep
+
+
 @app.get("/predictions/{device_id}")
 def predictions_all(device_id: str) -> Dict[str, Any]:
-    latest = db.get_latest_predictions_by_type(device_id)
+    latest = db.get_latest_predictions_by_type(device_id, keep=_own_backend_filter(device_id))
     return {
         "device_id": device_id,
         "timestamp": _now(),
@@ -279,7 +300,7 @@ def summary(device_id: str) -> Dict[str, Any]:
             derived = calculate_derived_values(ordered[-1], bundle.config, ordered)
             derived["_live_computed"] = True
 
-    predictions = db.get_latest_predictions_by_type(device_id)
+    predictions = db.get_latest_predictions_by_type(device_id, keep=_own_backend_filter(device_id))
     active_alerts = db.get_alerts(device_id, resolved=False, limit=50)
     bundle = sched.get_models(device_id)
 

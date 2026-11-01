@@ -13,7 +13,7 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.9
       - key: DEVICE_ID
-        value: hackathon_machine
+        value: table_fan
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_KEY

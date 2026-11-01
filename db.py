@@ -11,7 +11,7 @@ maintenance windows, flaky site wifi at a demo).
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger("powersense.db")
 
@@ -420,12 +420,18 @@ def get_latest_prediction(
     return rows[0] if rows else None
 
 
-def get_latest_predictions_by_type(device_id: str) -> Dict[str, Any]:
-    """Map of prediction_type -> most recent prediction row for that type."""
+def get_latest_predictions_by_type(
+    device_id: str, keep: Optional[Callable[[Dict[str, Any]], bool]] = None
+) -> Dict[str, Any]:
+    """Map of prediction_type -> most recent prediction row for that type.
+
+    `keep`, if given, skips rows it returns False for -- main.py uses it so a
+    server only reports predictions from the model backend it is running.
+    """
     out: Dict[str, Any] = {}
     for row in get_predictions(device_id, limit=200):
         ptype = row.get("prediction_type")
-        if ptype and ptype not in out:
+        if ptype and ptype not in out and (keep is None or keep(row)):
             out[ptype] = row
     return out
 

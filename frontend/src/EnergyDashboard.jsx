@@ -45,7 +45,10 @@ import {
 // ---------------------------------------------------------------------------
 const SUPABASE_URL = "https://cgvjqmqdbsdneukkhbfc.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_lmNUWoyMAImqbsKshbKbBw_XcLVbQqe";
-const RENDER_URL = "https://powersense-6iuu.onrender.com";
+// VITE_API_URL (set in gitignored frontend/.env.development.local, so only
+// `npm run dev` sees it) points a local dashboard at a local backend; unset,
+// it talks to Render.
+const API_URL = import.meta.env.VITE_API_URL || "https://powersense-6iuu.onrender.com";
 const DEVICE_ID = "table_fan"; // matches the device_id actually posting to energy_readings_public
 const REFRESH_INTERVAL = 30000; // 30 seconds
 
@@ -159,6 +162,29 @@ const rupee = (v, digits = 2) =>
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   })}`;
+
+/** Like fmt(), but keeps two significant digits for small values -- a 3 W
+ * table fan forecasts 0.052 kWh/day, which fmt(v, 1) would flatten to "0.1". */
+const fmtAuto = (v, digits = 1) => {
+  const n = num(v);
+  return n !== 0 && Math.abs(n) < 1 ? String(Number(n.toPrecision(2))) : n.toFixed(digits);
+};
+const rupeeAuto = (v, digits = 2) => {
+  const n = num(v);
+  return n !== 0 && Math.abs(n) < 0.01 ? `₹${Number(n.toPrecision(2))}` : rupee(n, digits);
+};
+
+/** "45 s", "12 min", "3.2 h", "2.1 days" */
+function formatAge(ms) {
+  const s = Math.max(0, ms / 1000);
+  if (s < 90) return `${Math.round(s)} s`;
+  if (s < 5400) return `${Math.round(s / 60)} min`;
+  if (s < 172800) return `${(s / 3600).toFixed(1)} h`;
+  return `${(s / 86400).toFixed(1)} days`;
+}
+
+// A reading older than this means the device has stopped posting.
+const STALE_AFTER_MS = 3 * 60 * 1000;
 
 function healthColor(score) {
   const s = num(score);
@@ -323,7 +349,7 @@ async function fetchDerived() {
 
 async function fetchPredictions() {
   try {
-    const res = await fetch(`${RENDER_URL}/predictions/${DEVICE_ID}`);
+    const res = await fetch(`${API_URL}/predictions/${DEVICE_ID}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
     const preds = json?.predictions ?? {};
@@ -336,7 +362,7 @@ async function fetchPredictions() {
 
 async function fetchSummary() {
   try {
-    const res = await fetch(`${RENDER_URL}/summary/${DEVICE_ID}`);
+    const res = await fetch(`${API_URL}/summary/${DEVICE_ID}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   } catch (err) {
@@ -386,6 +412,21 @@ function StatCard({ icon: Icon, label, value, unit, sub, color }) {
       </div>
     </div>
   );
+}
+
+const MODEL_LABELS = {
+  autoencoder: "Autoencoder (DL)",
+  bilstm: "BiLSTM (DL)",
+  isolation_forest: "Isolation Forest (ML)",
+  linear_regression: "Linear Regression (ML)",
+  hourly_profile: "Hourly profile (baseline)",
+  recent_level: "Recent level (baseline)",
+};
+
+/** Which model produced a prediction, from its details.backend. */
+function ModelBadge({ backend }) {
+  if (!backend) return null;
+  return <div className="ps-pred-detail ps-pred-detail-dim">model: {MODEL_LABELS[backend] || backend}</div>;
 }
 
 function PredictionCard({ icon: Icon, title, trained, children }) {
@@ -442,21 +483,18 @@ export default function EnergyDashboard() {
 
   const loadAll = useCallback(async () => {
     setIsFetching(true);
-    const [readingsResult, derivedResult, predictionsResult, summaryResult] =
-      await Promise.allSettled([
-        fetchReadings(),
-        fetchDerived(),
-        fetchPredictions(),
-        fetchSummary(),
-      ]);
-
-    if (readingsResult.status === "fulfilled") {
-      setReadings(readingsResult.value.data);
-      setLiveMode(readingsResult.value.live);
-    }
-    if (derivedResult.status === "fulfilled") setDerived(derivedResult.value);
-    if (predictionsResult.status === "fulfilled") setPredictions(predictionsResult.value);
-    if (summaryResult.status === "fulfilled") setSummary(summaryResult.value);
+    // Apply each source as soon as it lands: the Render free tier can take
+    // ~50 s to cold-start, and the Supabase-backed cards shouldn't sit on
+    // mock data while the predictions call waits for it.
+    await Promise.allSettled([
+      fetchReadings().then((r) => {
+        setReadings(r.data);
+        setLiveMode(r.live);
+      }),
+      fetchDerived().then(setDerived),
+      fetchPredictions().then(setPredictions),
+      fetchSummary().then(setSummary),
+    ]);
 
     setLastUpdated(new Date());
     setIsFetching(false);
@@ -487,9 +525,21 @@ export default function EnergyDashboard() {
   // spec), not a true calendar-day window -- the pipeline posts every 5s, so
   // 100 rows covers only the most recent few minutes in a live deployment.
 
+  const readingAgeMs = lastUpdated
+    ? lastUpdated.getTime() - new Date(latestReading.created_at).getTime()
+    : 0;
+  const isStale = liveMode && readingAgeMs > STALE_AFTER_MS;
+
+  // Bar scales follow the machine's rated values from the backend config, so
+  // a 0.025 A fan doesn't render as an empty bar on a 10 A scale.
+  const ratedCurrent = num(summary?.config?.rated_current, 10);
+  const ratedPower = num(summary?.config?.rated_power, 2000);
+  const nominalVoltage = num(summary?.config?.nominal_voltage, 230);
+
+  const rul = summary?.health?.rul;
+
   const machineState = String(derived?.machine_state || "off").toLowerCase();
-  const isOverload = machineState === "overload";
-  const isIdle = machineState === "idle";
+  const isOverload = machineState === "overload" && !isStale;
 
   const dailyCarbon = useMemo(() => {
     const perHour = num(derived?.carbon_footprint_kg);
@@ -512,7 +562,10 @@ export default function EnergyDashboard() {
 
     const latestPf = series[series.length - 1].y;
     const { slope, r2 } = linearSlope(series);
-    const perSampleSeconds = 5; // device posting cadence
+    // Measured cadence (the fan posts every ~30 s), not an assumed constant.
+    const spanSeconds =
+      (new Date(readings[0].created_at) - new Date(readings[readings.length - 1].created_at)) / 1000;
+    const perSampleSeconds = spanSeconds > 0 ? spanSeconds / (readings.length - 1) : 30;
 
     if (latestPf < 0.85) {
       return { status: "active", daysUntil: 0, latestPf };
@@ -553,6 +606,11 @@ export default function EnergyDashboard() {
               <WifiOff size={12} /> Demo data
             </span>
           )}
+          {isStale && (
+            <span className="ps-badge ps-badge-muted">
+              <WifiOff size={12} /> Device offline
+            </span>
+          )}
         </div>
         <div className="ps-header-right">
           <span className="ps-updated">
@@ -568,6 +626,20 @@ export default function EnergyDashboard() {
 
       <main className="ps-main">
         {/* ---- Machine status banner ---- */}
+        {isStale ? (
+        <section className="ps-banner ps-banner-off">
+          <div className="ps-banner-icon">
+            <WifiOff size={22} />
+          </div>
+          <div className="ps-banner-text">
+            <div className="ps-banner-title">NO RECENT DATA</div>
+            <div className="ps-banner-sub">
+              Last reading {formatAge(readingAgeMs)} ago ({new Date(latestReading.created_at).toLocaleString()})
+              {" "}&mdash; showing last known values. Last state: {machineState.replace("_", " ")}.
+            </div>
+          </div>
+        </section>
+        ) : (
         <section
           className={`ps-banner ps-banner-${machineState} ${isOverload ? "ps-banner-flash" : ""}`}
         >
@@ -590,22 +662,25 @@ export default function EnergyDashboard() {
               {machineState === "normal" && "Operating within normal parameters."}
               {machineState === "light_load" && "Running under light load."}
               {machineState === "heavy_load" && "Running under heavy load -- monitor closely."}
+              {" "}Last reading {formatAge(readingAgeMs)} ago.
             </div>
           </div>
         </section>
+        )}
 
         {/* ---- KPI grid ---- */}
         <section className="ps-kpi-grid">
           <StatCard
             icon={Zap}
-            label="Total Energy Today"
+            label="Energy Meter"
             value={fmt(latestReading.active_energy, 2)}
             unit="kWh"
+            sub="cumulative"
           />
           <StatCard
             icon={Activity}
             label="Current Power"
-            value={fmt(derived?.active_power ?? latestReading.active_power, 0)}
+            value={fmt(derived?.active_power ?? latestReading.active_power, ratedPower < 100 ? 1 : 0)}
             unit="W"
             color={isOverload ? "var(--red)" : undefined}
           />
@@ -625,15 +700,17 @@ export default function EnergyDashboard() {
           />
           <StatCard
             icon={TrendingUp}
-            label="Peak Power Today"
-            value={fmt(peakPowerToday, 0)}
+            label="Peak Power"
+            value={fmt(peakPowerToday, ratedPower < 100 ? 1 : 0)}
             unit="W"
+            sub={`last ${readings.length} readings`}
           />
           <StatCard
             icon={DollarSign}
-            label="Idle Cost Today"
-            value={rupee(derived?.idle_cost_per_hour, 2)}
-            sub={`${rupee(derived?.idle_cost_per_hour, 2)}/hr if idle`}
+            label="Idle Cost"
+            value={rupeeAuto(derived?.idle_cost_per_hour, 2)}
+            unit="/hr"
+            sub="cost of running idle"
           />
         </section>
 
@@ -685,7 +762,7 @@ export default function EnergyDashboard() {
               label="Voltage"
               value={latestReading.voltage}
               min={0}
-              max={300}
+              max={nominalVoltage * 1.3}
               unit="V"
               digits={1}
             />
@@ -693,17 +770,17 @@ export default function EnergyDashboard() {
               label="Current"
               value={latestReading.current}
               min={0}
-              max={10}
+              max={ratedCurrent * 1.5}
               unit="A"
-              digits={2}
+              digits={ratedCurrent < 1 ? 3 : 2}
             />
             <ProgressBar
               label="Active Power"
               value={latestReading.active_power}
               min={0}
-              max={2000}
+              max={ratedPower * 1.5}
               unit="W"
-              digits={0}
+              digits={ratedPower < 100 ? 1 : 0}
             />
             <ProgressBar
               label="Power Factor"
@@ -733,7 +810,7 @@ export default function EnergyDashboard() {
           </div>
         </section>
 
-        {/* ---- Health gauge + DL predictions ---- */}
+        {/* ---- Health gauge + model predictions ---- */}
         <section className="ps-grid-2col-rev">
           <div className="ps-card ps-gauge-card">
             <div className="ps-card-title">Motor Health</div>
@@ -743,6 +820,14 @@ export default function EnergyDashboard() {
               <span className="ps-gauge-max">/100</span>
             </div>
             <div className="ps-gauge-label">{derived?.motor_health_label || "unknown"}</div>
+            {rul && (
+              <div className="ps-pred-detail">
+                Trend: {rul.trend_direction || "unknown"}
+                {rul.rul_days != null
+                  ? ` · RUL ~${fmt(rul.rul_days, 0)} days`
+                  : " · no end-of-life projected"}
+              </div>
+            )}
           </div>
 
           <div className="ps-pred-grid">
@@ -759,13 +844,20 @@ export default function EnergyDashboard() {
               <div className="ps-pred-detail ps-pred-detail-dim">
                 score {fmt(predictions?.anomaly?.value, 3)}
               </div>
+              <ModelBadge backend={predictions?.anomaly?.details?.backend} />
             </PredictionCard>
 
             <PredictionCard icon={TrendingUp} title="24h Energy Forecast" trained={!!predictions?.forecast}>
-              <div className="ps-pred-main">{fmt(predictions?.forecast?.value, 1)} kWh</div>
+              <div className="ps-pred-main">{fmtAuto(predictions?.forecast?.value, 1)} kWh</div>
               <div className="ps-pred-detail">
-                Est. cost {rupee(predictions?.forecast?.details?.estimated_cost, 0)}
+                Est. cost {rupeeAuto(predictions?.forecast?.details?.estimated_cost, 2)}
               </div>
+              {predictions?.forecast?.details?.peak_hour != null && (
+                <div className="ps-pred-detail ps-pred-detail-dim">
+                  peak at {String(predictions.forecast.details.peak_hour).padStart(2, "0")}:00 UTC
+                </div>
+              )}
+              <ModelBadge backend={predictions?.forecast?.details?.backend} />
             </PredictionCard>
 
             <PredictionCard icon={Flame} title="PF Degradation" trained={!!pfTrend}>
@@ -801,6 +893,7 @@ export default function EnergyDashboard() {
                 {faultPrediction?.label || "NORMAL"}
               </div>
               <div className="ps-pred-detail">{faultDetails.action || "Continue normal operation"}</div>
+              <div className="ps-pred-detail ps-pred-detail-dim">model: rule-based (12 fault rules)</div>
             </PredictionCard>
           </div>
         </section>
@@ -858,15 +951,17 @@ export default function EnergyDashboard() {
             <div className="ps-cost-grid">
               <div className="ps-cost-item">
                 <div className="ps-cost-label">Per hour</div>
-                <div className="ps-cost-value">{rupee(derived?.cost_per_hour, 2)}</div>
+                <div className="ps-cost-value">{rupeeAuto(derived?.cost_per_hour, 2)}</div>
               </div>
               <div className="ps-cost-item">
                 <div className="ps-cost-label">Daily projected</div>
-                <div className="ps-cost-value">{rupee(derived?.daily_cost_projected, 2)}</div>
+                <div className="ps-cost-value">{rupeeAuto(derived?.daily_cost_projected, 2)}</div>
               </div>
               <div className="ps-cost-item">
                 <div className="ps-cost-label">Monthly projected</div>
-                <div className="ps-cost-value">{rupee(derived?.monthly_cost_projected, 0)}</div>
+                <div className="ps-cost-value">
+                  {rupee(derived?.monthly_cost_projected, num(derived?.monthly_cost_projected) < 100 ? 2 : 0)}
+                </div>
               </div>
             </div>
           </div>
@@ -879,11 +974,11 @@ export default function EnergyDashboard() {
             <div className="ps-cost-grid">
               <div className="ps-cost-item">
                 <div className="ps-cost-label">Current</div>
-                <div className="ps-cost-value">{fmt(derived?.carbon_footprint_kg, 3)} kg/hr</div>
+                <div className="ps-cost-value">{fmtAuto(derived?.carbon_footprint_kg, 3)} kg/hr</div>
               </div>
               <div className="ps-cost-item">
                 <div className="ps-cost-label">Daily projected</div>
-                <div className="ps-cost-value">{fmt(dailyCarbon, 2)} kg CO&#8322;</div>
+                <div className="ps-cost-value">{fmtAuto(dailyCarbon, 2)} kg CO&#8322;</div>
               </div>
             </div>
           </div>
