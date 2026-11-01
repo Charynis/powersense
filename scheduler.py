@@ -39,8 +39,8 @@ DEVICE_ID = os.environ.get("DEVICE_ID", "hackathon_machine")
 MACHINE_NAME = os.environ.get("MACHINE_NAME", "Demo Machine")
 
 # DL_ONLY=true is for a local instance running alongside Render against the
-# same Supabase: it only runs the PyTorch models (autoencoder / BiLSTM) and
-# skips the engine, fault, alert, health and daily jobs Render already runs.
+# same Supabase: it runs the engine plus the PyTorch models (autoencoder /
+# BiLSTM) and skips the fault, alert, health and daily jobs Render runs.
 DL_ONLY = os.environ.get("DL_ONLY", "false").lower() in ("true", "1", "yes")
 DL_BACKENDS = ("autoencoder", "bilstm")
 
@@ -678,18 +678,24 @@ def start_scheduler(device_id: str = DEVICE_ID):
 
 
 def _start_dl_only(scheduler, device_id: str, IntervalTrigger):
-    """Register only the jobs whose model is a PyTorch backend, run each once
-    so the dashboard has a DL prediction immediately, and start."""
+    """Register the engine plus the jobs whose model is a PyTorch backend,
+    run each once so the dashboard has data immediately, and start."""
     global _scheduler
     bundle = get_models(device_id)
-    jobs = []
+    # The engine runs here too: Render's free tier sleeps without HTTP
+    # traffic (the ESP writes to Supabase, not Render), and a local dashboard
+    # only talks to localhost, so derived_values would otherwise go stale.
+    # insert_derived_values upserts on (device_id, timestamp), so both
+    # instances processing the same reading write one row, not two.
+    jobs = [(run_engine_job, IntervalTrigger(seconds=ENGINE_INTERVAL_SECONDS),
+             "engine", "Derived values engine (30s)")]
     if bundle.anomaly.status().get("backend") in DL_BACKENDS:
         jobs.append((run_anomaly_job, IntervalTrigger(minutes=ANOMALY_INTERVAL_MINUTES),
                      "anomaly", "Autoencoder anomaly (5min, DL_ONLY)"))
     if bundle.forecast.status().get("backend") in DL_BACKENDS:
         jobs.append((run_forecast_job, IntervalTrigger(minutes=FORECAST_INTERVAL_MINUTES),
                      "forecast", "BiLSTM forecast (30min, DL_ONLY)"))
-    if not jobs:
+    if len(jobs) == 1:
         logger.warning(
             "DL_ONLY is set but no PyTorch model is loaded for %s -- is torch "
             "installed and are the .pt files in models/trained/?", device_id,
