@@ -171,6 +171,9 @@ class EnergyForecaster:
         self.bilstm_window: int = 48
         self.bilstm_scaler: Optional[Any] = None
         self.bilstm_last_trained: Optional[str] = None
+        # hour-of-day -> [active_power, power_factor, voltage] from training;
+        # used to pad short live windows with this device's own load shape.
+        self.bilstm_profile: Dict[int, List[float]] = {}
 
         self.model_path = os.path.join(self.model_dir, f"forecast_{device_id}.pkl")
         self.bilstm_path = os.path.join(self.model_dir, f"forecast_{device_id}.pt")
@@ -250,6 +253,21 @@ class EnergyForecaster:
             records, columns=["__ts", "active_power", "power_factor", "voltage"]
         ).set_index("__ts")
 
+    def _profile_hourly_tail(self, n: int) -> pd.DataFrame:
+        """n hours ending just before "now" built from the BiLSTM bundle's
+        per-hour training profile -- the same scale the network was trained
+        on, unlike _synthetic_hourly_tail's generic ~1 kW factory shift."""
+        end = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        fallback = [float(v) for v in np.mean(list(self.bilstm_profile.values()), axis=0)]
+        records = []
+        for i in range(n):
+            ts = end - timedelta(hours=n - 1 - i)
+            power, pf, voltage = self.bilstm_profile.get(ts.hour, fallback)
+            records.append((ts, power, pf, voltage))
+        return pd.DataFrame(
+            records, columns=["__ts", "active_power", "power_factor", "voltage"]
+        ).set_index("__ts")
+
     def _build_hourly_window(self, recent_readings: List[Dict[str, Any]], window: int) -> "tuple[pd.DataFrame, int]":
         """Resample recent raw readings to hourly [power, pf, voltage] and
         return exactly `window` rows ending at the most recent hour,
@@ -282,7 +300,11 @@ class EnergyForecaster:
 
         real_points = len(hourly)
         if real_points < window:
-            padding = self._synthetic_hourly_tail(window - real_points)
+            padding = (
+                self._profile_hourly_tail(window - real_points)
+                if self.bilstm_profile
+                else self._synthetic_hourly_tail(window - real_points)
+            )
             hourly = pd.concat([padding, hourly]).sort_index()
 
         return hourly.iloc[-window:], real_points
@@ -732,6 +754,10 @@ class EnergyForecaster:
             self.bilstm = net
             self.bilstm_window = int(bundle.get("window", 48))
             self.bilstm_scaler = _load(self.bilstm_scaler_path)
+            self.bilstm_profile = {
+                int(h): [float(v) for v in vals]
+                for h, vals in (bundle.get("hourly_profile") or {}).items()
+            }
             self.bilstm_last_trained = bundle.get("last_trained")
 
             logger.info(

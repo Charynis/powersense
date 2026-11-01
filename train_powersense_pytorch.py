@@ -45,7 +45,7 @@ import logging
 import math
 import os
 from datetime import datetime, timezone
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import joblib
 import numpy as np
@@ -92,6 +92,9 @@ FORECAST_FEATURES = ["active_power", "power_factor", "voltage"]
 FORECAST_WINDOW = 48       # hours of history fed to the BiLSTM
 FORECAST_HORIZON = 24      # hours predicted
 MIN_FORECAST_HOURS = FORECAST_WINDOW + FORECAST_HORIZON
+# Days of synthetic hourly history prepended when a device has fewer than
+# MIN_FORECAST_HOURS real hours (see extend_hourly_series).
+SYNTHETIC_FORECAST_DAYS = 21
 
 AE_DROPOUT = 0.2
 AE_EPOCHS = 60
@@ -417,6 +420,46 @@ def build_hourly_series(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def extend_hourly_series(
+    hourly: pd.DataFrame, days: int = SYNTHETIC_FORECAST_DAYS, seed: int = 42
+) -> pd.DataFrame:
+    """Time-axis augmentation for the BiLSTM. augment_data() only adds rows
+    inside the real recording span, so it can't create the 72 distinct hours
+    a 48h-in / 24h-out window needs. This prepends `days` of synthetic hours
+    ending just before the first real hour: each one samples a real hourly
+    reading from the same hour-of-day (with a few percent of jitter), and
+    hours of the day never seen in the real data use the real "off"
+    readings -- the fan isn't assumed to run at times it was never logged.
+    """
+    if hourly.empty or len(hourly) >= MIN_FORECAST_HOURS:
+        return hourly
+
+    rng = np.random.default_rng(seed)
+    by_hour = {h: grp for h, grp in hourly.groupby(hourly.index.hour)}
+    off_rows = hourly[hourly["active_power"] <= 0.5]
+    if off_rows.empty:
+        off_rows = pd.DataFrame(
+            [{"active_power": 0.0, "power_factor": 0.0, "voltage": float(hourly["voltage"].mean())}]
+        )
+
+    start = hourly.index.min() - pd.Timedelta(hours=days * 24)
+    records = []
+    for ts in pd.date_range(start, periods=days * 24, freq="1h"):
+        pool = by_hour.get(ts.hour, off_rows)
+        src = pool.iloc[int(rng.integers(len(pool)))]
+        power = max(0.0, float(src["active_power"]) * (1.0 + rng.normal(0, 0.05)))
+        pf = float(np.clip(float(src["power_factor"]) + rng.normal(0, 0.01), 0.0, 1.0)) if power > 0 else float(src["power_factor"])
+        voltage = float(np.clip(float(src["voltage"]) + rng.normal(0, 1.0), 200.0, 240.0))
+        records.append((ts, power, pf, voltage))
+
+    synthetic = pd.DataFrame(records, columns=["__ts", *FORECAST_FEATURES]).set_index("__ts")
+    logger.info(
+        "extend_hourly_series: %d real hours + %d synthetic hours (%d days)",
+        len(hourly), len(synthetic), days,
+    )
+    return pd.concat([synthetic, hourly]).sort_index()
+
+
 def build_forecast_windows(hourly: pd.DataFrame, scaler: StandardScaler):
     """Sliding 48h-in / 24h-out windows over the hourly series."""
     values = scaler.transform(hourly[FORECAST_FEATURES].to_numpy(dtype=np.float32))
@@ -490,7 +533,19 @@ def train_autoencoder(device_id: str, matrix: np.ndarray, scaler: StandardScaler
     logger.info("Saved autoencoder for %s (threshold=%.6f)", device_id, threshold)
 
 
-def train_forecaster(device_id: str, X: np.ndarray, y: np.ndarray) -> None:
+def hourly_profile(hourly: pd.DataFrame) -> Dict[int, List[float]]:
+    """hour-of-day -> mean FORECAST_FEATURES. Saved in the BiLSTM bundle so
+    models/forecast.py can pad a short live window with this device's own
+    load shape instead of its generic factory-shift profile."""
+    return {
+        int(h): [float(v) for v in grp[FORECAST_FEATURES].mean().tolist()]
+        for h, grp in hourly.groupby(hourly.index.hour)
+    }
+
+
+def train_forecaster(
+    device_id: str, X: np.ndarray, y: np.ndarray, profile: Optional[Dict[int, List[float]]] = None
+) -> None:
     if len(X) < 10:
         logger.warning("Skipping forecaster for %s: only %d windows", device_id, len(X))
         return
@@ -529,6 +584,7 @@ def train_forecaster(device_id: str, X: np.ndarray, y: np.ndarray) -> None:
             "num_layers": BILSTM_LAYERS,
             "output_size": FORECAST_HORIZON,
             "window": FORECAST_WINDOW,
+            "hourly_profile": profile or {},
             "last_trained": last_trained,
         },
         os.path.join(MODEL_DIR, f"forecast_{device_id}.pt"),
@@ -568,7 +624,7 @@ def main() -> None:
     hourly_by_device: Dict[str, pd.DataFrame] = {}
     for device_id in devices:
         subset = derived[derived["device_id"] == device_id] if "device_id" in derived.columns else derived
-        hourly_by_device[device_id] = build_hourly_series(subset)
+        hourly_by_device[device_id] = extend_hourly_series(build_hourly_series(subset))
 
     forecastable = [h for h in hourly_by_device.values() if len(h) >= MIN_FORECAST_HOURS]
     forecast_scaler = StandardScaler()
@@ -595,7 +651,7 @@ def main() -> None:
             )
             continue
         X, y = build_forecast_windows(hourly, forecast_scaler)
-        train_forecaster(device_id, X, y)
+        train_forecaster(device_id, X, y, hourly_profile(hourly))
 
     logger.info("Training complete. Artifacts written to %s", MODEL_DIR)
 
